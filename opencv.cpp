@@ -67,10 +67,13 @@ inline float sigmoid(float x) {
 
 int main() {
     string palmDetectorPath = "D:/opencv/x64/Release/palm_detection_mediapipe_2023feb.onnx";
+    string handLandmarkerPath = "D:\\opencv\\x64\\Release\\handpose_estimation_mediapipe_2023feb.onnx";
 
     Net netDetector;
+    Net hlDetector;
     try {
         netDetector = readNetFromONNX(palmDetectorPath);
+        hlDetector = readNetFromONNX(handLandmarkerPath);
     }
     catch (const cv::Exception& e) {
         cout << "[OpenCV Error loading detector]: " << e.what() << endl;
@@ -81,13 +84,14 @@ int main() {
         cout << "[ERROR] Palm detector model is empty!" << endl;
         return -1;
     }
-    cout << "Palm detector loaded successfully." << endl;
+    cout << "detectors loaded successfully." << endl;
 
     // Precompute the anchors
     vector<Anchor> anchors = generateAnchors();
 
     // Query model output names (MediaPipe palm detector has two outputs: regressors and classifiers)
     vector<string> outNames = netDetector.getUnconnectedOutLayersNames();
+    vector<string> landmarkOutNames = hlDetector.getUnconnectedOutLayersNames();
 
     VideoCapture cap(0);
     if (!cap.isOpened()) {
@@ -139,53 +143,133 @@ int main() {
             rawScores = outputs[0];
         }
 
-        // Reshape matrices to 2D (num_anchors x features)
         int num_anchors = anchors.size();
         int box_features = rawBoxes.total() / num_anchors;
 
-        float* pScores = (float*)rawScores.data;
+        float* logit = (float*)rawScores.data;
         float* pBoxes = (float*)rawBoxes.data;
+
+
+        //mathematik ist die zukunft
+
 
         vector<Rect> bboxes;
         vector<float> confidences;
 
-        // 4. Decode anchors
+        // A--
         for (int i = 0; i < num_anchors; ++i) {
-            float score = sigmoid(pScores[i]);
+            float score = sigmoid(logit[i]);      // raw score zu confidence probability
 
             if (score >= scoreThreshold) {
-                // pBoxes contains [dx, dy, dw, dh, 7 keypoints * 2] normalized to 192.0
-                float* box_ptr = pBoxes + (i * box_features);
+                // 18 values                                         
+                float* box_ptr = pBoxes + (i * box_features);                                          
 
                 float dx = box_ptr[0] / 192.0f;
-                float dy = box_ptr[1] / 192.0f;
+
+
+                float dy = box_ptr[1] / 192.0f;       
                 float dw = box_ptr[2] / 192.0f;
-                float dh = box_ptr[3] / 192.0f;
+                float dh = box_ptr[3] / 192.0f; // stop  conflicting units of measurement
+
 
                 float cx = dx + anchors[i].x_center;
                 float cy = dy + anchors[i].y_center;
                 float w = dw;
                 float h = dh;
 
-                // Scale to original frame dimensions
-                int x_min = static_cast<int>((cx - w / 2.0f) * frame.cols);
-                int y_min = static_cast<int>((cy - h / 2.0f) * frame.rows);
-                int box_w = static_cast<int>(w * frame.cols);
-                int box_h = static_cast<int>(h * frame.rows);
+                float differentialH = dh * 1.8;                  
+                float differentialW = dw * 1.5;
+                float differentialCY = cy - (dh*0.5f);
+                 
+
+                
+
+                float wX = box_ptr[4];
+                float wY = box_ptr[5];
+
+                float mcpX = box_ptr[8];
+                float mcpY = box_ptr[9];
+
+                float normalizedmcpX = (mcpX / 192.0f) + anchors[i].x_center;
+                float normalizedmcpY = (mcpY / 192.0f) + anchors[i].x_center;
+                float normalizedwX = (wX / 192.0f) + anchors[i].x_center;
+                float normalizedwY = (wY / 192.0f) + anchors[i].x_center;
+
+
+                // screen pixel
+
+                int _wristX = static_cast<int>(normalizedwX * frame.cols);
+                int _wristY = static_cast<int>(normalizedwY * frame.rows);
+                int _mcpX = static_cast<int>(normalizedmcpX * frame.cols);
+                int _mcpY = static_cast<int>(normalizedmcpY * frame.rows);
+
+
+                float vectorX = (mcpX - wX);
+                float vectorY = (mcpY - wY);
+
+                // Das Über Ingenieurwesen
+
+
+                int x_min = static_cast<int>((cx - differentialW / 2.0f) * frame.cols);
+                int y_min = static_cast<int>((differentialCY - differentialH / 2.0f) * frame.rows);
+                int box_w = static_cast<int>(differentialW * frame.cols);
+                int box_h = static_cast<int>(differentialH * frame.rows);
 
                 bboxes.push_back(Rect(x_min, y_min, box_w, box_h));
                 confidences.push_back(score);
             }
         }
 
-        // 5. Apply Non-Maximum Suppression (NMS)
+
+        Rect frameBounds(0, 0, frame.cols, frame.rows);
+         // non maximium supression 
         vector<int> indices;
         NMSBoxes(bboxes, confidences, scoreThreshold, nmsThreshold, indices);
 
-        // 6. Draw bounding boxes on the original camera frame
+        // bounding boxes 
         for (int idx : indices) {
             cout << idx << endl;
             Rect box = bboxes[idx];
+
+            Rect safeROI = box & frameBounds;
+
+            if (safeROI.width <= 0 || safeROI.height <= 0) continue;
+            Mat handCrop = frame(safeROI);
+            
+
+            Mat ResizedROI;
+            resize(handCrop, ResizedROI, Size(224, 224));
+            cvtColor(ResizedROI, ResizedROI, cv::COLOR_BGR2RGB);
+
+            cv::Mat floatROI;
+            ResizedROI.convertTo(floatROI, CV_32FC3, 1.0 / 255.0);
+            //
+
+            //4D Tensor
+            int l_sz[] = { 1, 224, 224, 3 };
+            cv::Mat landmarkBlob(4, l_sz, CV_32F, floatROI.data);
+
+            std::vector<cv::Mat> landmarkOutputs;
+            hlDetector.setInput(landmarkBlob);
+            hlDetector.forward(landmarkOutputs, landmarkOutNames);
+
+            const float* kpts = reinterpret_cast<const float*>(landmarkOutputs[0].data);
+            float hand_conf = landmarkOutputs[1].at<float>(0, 0);
+
+            if (hand_conf > 0.5f) {
+                for (int k = 0; k < 21; ++k) {
+                    // Normalize from [0, 224] -> [0.0, 1.0], scale by ROI size, and add ROI top-left offset
+                    float orig_x = safeROI.x + (kpts[k * 3 + 0] / 224.0f) * safeROI.width;
+                    float orig_y = safeROI.y + (kpts[k * 3 + 1] / 224.0f) * safeROI.height;
+
+                    cv::circle(frame, cv::Point(static_cast<int>(orig_x), static_cast<int>(orig_y)), 3, cv::Scalar(0, 255, 0), -1);
+                }
+            }
+
+
+            rectangle(frame, safeROI, Scalar(0, 255, 255), 2);
+
+
 
             // Clamp box to image bounds
             box.x = std::max(0, box.x);
@@ -193,7 +277,7 @@ int main() {
             box.width = std::min(box.width, frame.cols - box.x);
             box.height = std::min(box.height, frame.rows - box.y);
 
-            rectangle(frame, box, Scalar(0, 255, 0), 2);
+            //rectangle(frame, box, Scalar(0, 255, 0), 2);
 
             string label = format("Palm: %.2f", confidences[idx]);
             int baseLine = 0;
